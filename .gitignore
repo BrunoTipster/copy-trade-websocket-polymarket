@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+bot_output.log
+bot_error.log
+copytrade/
+test_*.py
