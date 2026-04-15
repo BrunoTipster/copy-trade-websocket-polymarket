@@ -31,6 +31,8 @@ TELEGRAM_CHAT_ID = "-1003910452966"
 
 INTERVALO_REST   = 8    # segundos entre polling REST completo
 MIN_VALOR        = 1.0  # ignora trades abaixo de $X
+MIN_CHANCE       = 5.0  # ignora trades com chance abaixo de X% (filtra spray/lixo)
+MIN_CHANCE_NO    = 5.0  # mínimo para apostas "No" também
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -314,6 +316,23 @@ def processar_trades_wallet(wallet, nome):
         size  = float(t.get("size", 0))
         if price * size < MIN_VALOR:
             continue
+
+        # Filtro inteligente: ignora apostas de spray/lixo
+        chance = price * 100
+        outcome = (t.get("outcome") or "").lower()
+        side = t.get("side", "?")
+
+        if side == "BUY" and outcome == "yes" and chance < MIN_CHANCE:
+            # Apostou SIM em algo com menos de 5% de chance = spray
+            print(f"[FILTRO] {nome}: BUY Yes {chance:.1f}% (< {MIN_CHANCE}%) — ignorado")
+            continue
+
+        if side == "BUY" and outcome == "no":
+            # Apostou NÃO = está apostando contra. Chance do "No" = price
+            chance_no = price * 100
+            if chance_no < MIN_CHANCE_NO:
+                print(f"[FILTRO] {nome}: BUY No {chance_no:.1f}% — ignorado")
+                continue
 
         msg = formatar_trade(t, nome)
         side  = t.get("side", "?")
