@@ -78,6 +78,47 @@ asset_ids_ativos   = set()   # asset_ids das posições abertas (para WS)
 ws_triggered       = set()
 ws_lock            = threading.Lock()
 
+# ── Estatísticas WIN/LOSS (resetam a cada 30min) ──
+STATS_FILE = "stats.json"
+stats_periodo = {"wins": 0, "losses": 0, "lucro": 0.0, "inicio": time.time()}
+
+
+def stats_salvar():
+    """Salva stats do período no JSON."""
+    try:
+        historico = []
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, "r") as f:
+                historico = json.load(f)
+        historico.append({
+            "inicio": datetime.fromtimestamp(stats_periodo["inicio"]).strftime("%d/%m %H:%M"),
+            "fim": datetime.now().strftime("%d/%m %H:%M"),
+            "wins": stats_periodo["wins"],
+            "losses": stats_periodo["losses"],
+            "lucro": round(stats_periodo["lucro"], 2),
+        })
+        # Guarda só os últimos 48 períodos (24h)
+        with open(STATS_FILE, "w") as f:
+            json.dump(historico[-48:], f, indent=2)
+    except Exception as e:
+        print(f"[ERRO] stats_salvar: {e}")
+
+
+def stats_resetar():
+    """Salva e reseta as stats do período."""
+    global stats_periodo
+    stats_salvar()
+    stats_periodo = {"wins": 0, "losses": 0, "lucro": 0.0, "inicio": time.time()}
+
+
+def stats_registrar(resultado, lucro):
+    """Registra um WIN ou LOSS."""
+    if resultado == "WIN":
+        stats_periodo["wins"] += 1
+    else:
+        stats_periodo["losses"] += 1
+    stats_periodo["lucro"] += lucro
+
 # WebSocket app global
 ws_app = None
 
@@ -303,15 +344,25 @@ def formatar_resultado(a, nome, pos):
 
     if usdc > 0 and custo > 0:
         lucro = round(usdc - custo, 2)
-        emoji, resultado = ("\U0001f3c6", "WIN") if lucro >= 0 else ("\U0001f4a5", "LOSS")
+        if lucro >= 0:
+            emoji, resultado = "🏆", "WIN"
+            cor_resultado = "🟢🟢🟢 <b>WIN +$" + str(lucro) + "</b> 🟢🟢🟢"
+        else:
+            emoji, resultado = "💥", "LOSS"
+            cor_resultado = "🔴🔴🔴 <b>LOSS $" + str(lucro) + "</b> 🔴🔴🔴"
     elif usdc > 0:
-        emoji, resultado, lucro = "\U0001f3c6", "WIN", round(usdc, 2)
+        emoji, resultado, lucro = "🏆", "WIN", round(usdc, 2)
+        cor_resultado = "🟢🟢🟢 <b>WIN +$" + str(lucro) + "</b> 🟢🟢🟢"
     else:
-        emoji, resultado, lucro = "\U0001f4a5", "LOSS", 0
+        emoji, resultado, lucro = "💥", "LOSS", 0
+        cor_resultado = "🔴🔴🔴 <b>LOSS $0</b> 🔴🔴🔴"
+
+    # Registra nas stats do período
+    stats_registrar(resultado, lucro)
 
     link = f"https://polymarket.com/event/{slug}" if slug else ""
     msg = (
-        f"{emoji} <b>{resultado}</b> — Polymarket\n"
+        f"{cor_resultado}\n\n"
         f"\U0001f464 <b>{nome}</b>\n"
         f"\U0001f3af Mercado: <b>{adicionar_celsius(traduzir(title))}</b>\n"
         f"\U0001f4cc Resultado: <b>{traduzir(outcome)}</b>\n\n"
@@ -320,7 +371,6 @@ def formatar_resultado(a, nome, pos):
         msg += f"\U0001f4b0 Entrada: <b>${custo}</b>\n"
     msg += (
         f"\U0001f4b5 Recebeu: <b>${round(usdc, 2)}</b>\n"
-        f"\U0001f4c8 Lucro/Prejuízo: <b>${lucro}</b>\n"
         f"\U0001f552 {dt}\n"
     )
     if link:
@@ -592,6 +642,35 @@ def main():
         # A cada 30s checa WIN/LOSS
         if ciclo % (30 // INTERVALO_REST) == 0:
             checar_resultados()
+
+        # A cada 30 minutos: envia relatório, salva JSON e reseta
+        if ciclo % (1800 // INTERVALO_REST) == 0:
+            w = stats_periodo["wins"]
+            l = stats_periodo["losses"]
+            lucro = round(stats_periodo["lucro"], 2)
+            total = w + l
+            taxa = round((w / total * 100), 1) if total > 0 else 0
+            inicio = datetime.fromtimestamp(stats_periodo["inicio"]).strftime("%H:%M")
+            agora = datetime.now().strftime("%H:%M")
+
+            if lucro >= 0:
+                lucro_str = f"🟢 +${lucro}"
+            else:
+                lucro_str = f"🔴 ${lucro}"
+
+            relatorio = (
+                f"📊 <b>RELATÓRIO 30 MIN</b> ({inicio} → {agora})\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 Wins: <b>{w}</b>\n"
+                f"💥 Losses: <b>{l}</b>\n"
+                f"📈 Taxa de acerto: <b>{taxa}%</b>\n"
+                f"💵 Lucro/Prejuízo: <b>{lucro_str}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💾 Salvo em stats.json"
+            )
+            enviar(relatorio)
+            print(f"[STATS] W:{w} L:{l} Lucro:${lucro} → salvo e resetado")
+            stats_resetar()
 
         # Log periódico
         if ciclo % 60 == 0:
