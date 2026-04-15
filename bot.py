@@ -217,12 +217,13 @@ def formatar_trade(t, nome):
     slug    = t.get("eventSlug", "")
     ts      = t.get("timestamp", 0)
     tx      = t.get("transactionHash", "")
+    cid     = t.get("conditionId", "")
     valor   = round(price * size, 2)
     prob    = round(price * 100, 1)
     dt      = datetime.fromtimestamp(ts).strftime("%d/%m %H:%M:%S") if ts else "?"
 
     emoji = "\U0001f7e2" if side == "BUY" else "\U0001f534"
-    acao  = "COMPROU" if side == "BUY" else "VENDEU"
+    acao  = "COMPROU" if side == "BUY" else "VENDEU (SAIU)"
     link  = f"https://polymarket.com/event/{slug}" if slug else ""
 
     msg = (
@@ -234,8 +235,25 @@ def formatar_trade(t, nome):
         f"\U0001f4b0 Preço: ${price}\n"
         f"\U0001f4e6 Quantidade: <b>{size:.2f} shares</b>\n"
         f"\U0001f4b5 Valor: <b>${valor}</b>\n"
-        f"\U0001f552 {dt}\n"
     )
+
+    # Se SELL, mostra lucro/prejuízo comparando com entrada
+    if side == "SELL" and cid and cid in posicoes_abertas:
+        pos = posicoes_abertas[cid]
+        preco_entrada = float(pos.get("price", 0))
+        if preco_entrada > 0:
+            lucro_por_share = price - preco_entrada
+            lucro_total = round(lucro_por_share * size, 2)
+            pct = round((lucro_por_share / preco_entrada) * 100, 1)
+            if lucro_total >= 0:
+                msg += f"\n\U0001f4c8 <b>LUCRO: +${lucro_total} (+{pct}%)</b>\n"
+                msg += f"\U0001f4b2 Entrada: ${preco_entrada} → Saída: ${price}\n"
+            else:
+                msg += f"\n\U0001f4c9 <b>PREJUÍZO: ${lucro_total} ({pct}%)</b>\n"
+                msg += f"\U0001f4b2 Entrada: ${preco_entrada} → Saída: ${price}\n"
+
+    msg += f"\U0001f552 {dt}\n"
+
     if link:
         msg += f"\n\U0001f517 <a href=\"{link}\">Ver mercado</a>"
     if tx:
