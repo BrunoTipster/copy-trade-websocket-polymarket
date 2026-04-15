@@ -228,8 +228,37 @@ def formatar_trade(t, nome):
     acao  = "COMPROU" if side == "BUY" else "VENDEU (SAIU)"
     link  = f"https://polymarket.com/event/{slug}" if slug else ""
 
+    # Emoji do tipo de mercado baseado no título
+    title_low = title.lower()
+    if any(x in title_low for x in ["temperature", "weather", "rain", "snow", "wind", "celsius", "fahrenheit", "clima", "temperatura"]):
+        cat = "🌤️ Clima"
+    elif any(x in title_low for x in ["nhl", "hockey"]):
+        cat = "🏒 NHL"
+    elif any(x in title_low for x in ["mlb", "baseball"]):
+        cat = "⚾ MLB"
+    elif any(x in title_low for x in ["nba", "basketball"]):
+        cat = "🏀 NBA"
+    elif any(x in title_low for x in ["nfl", "american football"]):
+        cat = "🏈 NFL"
+    elif any(x in title_low for x in ["cricket", "ipl", "odi", "test match"]):
+        cat = "🏏 Cricket"
+    elif any(x in title_low for x in ["rugby", "six nations", "super rugby"]):
+        cat = "🏉 Rugby"
+    elif any(x in title_low for x in ["tennis", "atp", "wta", "wimbledon", "roland garros", "us open", "australian open"]):
+        cat = "🎾 Tennis"
+    elif any(x in title_low for x in ["soccer", "football", "premier league", "la liga", "serie a", "bundesliga", "champions league", "copa", "fifa", "mls", "ligue 1"]):
+        cat = "⚽ Futebol"
+    elif any(x in title_low for x in ["election", "president", "senate", "congress", "vote", "poll", "eleição"]):
+        cat = "🗳️ Política"
+    elif any(x in title_low for x in ["bitcoin", "btc", "eth", "crypto", "price"]):
+        cat = "₿ Crypto"
+    elif any(x in title_low for x in ["earthquake", "hurricane", "tornado", "flood", "disaster"]):
+        cat = "🌍 Geopolítica"
+    else:
+        cat = "📊 Geral"
+
     msg = (
-        f"{emoji} <b>{acao}</b> — Polymarket\n"
+        f"{emoji} <b>{acao}</b> — {cat}\n"
         f"\U0001f464 <b>{nome}</b>\n"
         f"\U0001f3af Mercado: <b>{adicionar_celsius(traduzir(title))}</b>\n"
         f"\u27a1\ufe0f Apostou no: <b>{traduzir(outcome)}</b>\n"
@@ -316,23 +345,6 @@ def processar_trades_wallet(wallet, nome):
         size  = float(t.get("size", 0))
         if price * size < MIN_VALOR:
             continue
-
-        # Filtro inteligente: ignora apostas de spray/lixo
-        chance = price * 100
-        outcome = (t.get("outcome") or "").lower()
-        side = t.get("side", "?")
-
-        if side == "BUY" and outcome == "yes" and chance < MIN_CHANCE:
-            # Apostou SIM em algo com menos de 5% de chance = spray
-            print(f"[FILTRO] {nome}: BUY Yes {chance:.1f}% (< {MIN_CHANCE}%) — ignorado")
-            continue
-
-        if side == "BUY" and outcome == "no":
-            # Apostou NÃO = está apostando contra. Chance do "No" = price
-            chance_no = price * 100
-            if chance_no < MIN_CHANCE_NO:
-                print(f"[FILTRO] {nome}: BUY No {chance_no:.1f}% — ignorado")
-                continue
 
         msg = formatar_trade(t, nome)
         side  = t.get("side", "?")
