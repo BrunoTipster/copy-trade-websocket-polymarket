@@ -298,18 +298,18 @@ def formatar_trade(t, nome):
     else:
         cat = "📊 Geral"
 
-    msg = (
-        f"{emoji} <b>{acao}</b> — {cat}\n"
-        f"\U0001f464 <b>{nome}</b>\n"
-        f"\U0001f3af Mercado: <b>{adicionar_celsius(traduzir(title))}</b>\n"
-        f"\u27a1\ufe0f Apostou no: <b>{traduzir(outcome)}</b>\n"
-        f"\U0001f4ca Chance: <b>{prob}%</b>\n\n"
-        f"\U0001f4b0 Preço: ${price}\n"
-        f"\U0001f4e6 Quantidade: <b>{size:.2f} shares</b>\n"
-        f"\U0001f4b5 Valor: <b>${valor}</b>\n"
-    )
+    # Traduz título e outcome
+    titulo_pt = adicionar_celsius(traduzir(title))
+    outcome_pt = traduzir(outcome)
 
-    # Se SELL, mostra lucro/prejuízo comparando com entrada
+    # Monta mensagem resumida e clara
+    msg = f"{emoji} <b>{acao}</b> — {cat}\n"
+    msg += f"👤 <b>{nome}</b>\n\n"
+    msg += f"📌 <b>{titulo_pt}</b>\n"
+    msg += f"🎯 Entrou no: <b>{outcome_pt}</b> a <b>{prob}%</b>\n"
+    msg += f"💵 <b>${valor}</b> ({size:.1f} shares @ ${price})\n"
+    msg += f"🕐 {dt}\n"
+
     if side == "SELL" and cid and cid in posicoes_abertas:
         pos = posicoes_abertas[cid]
         preco_entrada = float(pos.get("price", 0))
@@ -318,18 +318,15 @@ def formatar_trade(t, nome):
             lucro_total = round(lucro_por_share * size, 2)
             pct = round((lucro_por_share / preco_entrada) * 100, 1)
             if lucro_total >= 0:
-                msg += f"\n\U0001f4c8 <b>LUCRO: +${lucro_total} (+{pct}%)</b>\n"
-                msg += f"\U0001f4b2 Entrada: ${preco_entrada} → Saída: ${price}\n"
+                msg += f"📈 <b>LUCRO: +${lucro_total} (+{pct}%)</b>\n"
             else:
-                msg += f"\n\U0001f4c9 <b>PREJUÍZO: ${lucro_total} ({pct}%)</b>\n"
-                msg += f"\U0001f4b2 Entrada: ${preco_entrada} → Saída: ${price}\n"
-
-    msg += f"\U0001f552 {dt}\n"
+                msg += f"📉 <b>PREJUÍZO: ${lucro_total} ({pct}%)</b>\n"
+            msg += f"💲 Entrada ${preco_entrada} → Saída ${price}\n"
 
     if link:
-        msg += f"\n\U0001f517 <a href=\"{link}\">Ver mercado</a>"
+        msg += f"\n🔗 <a href=\"{link}\">Abrir mercado</a>"
     if tx:
-        msg += f"\n\U0001f50d <a href=\"https://polygonscan.com/tx/{tx}\">Polygonscan</a>"
+        msg += f"  🔍 <a href=\"https://polygonscan.com/tx/{tx}\">Tx</a>"
     return msg
 
 
