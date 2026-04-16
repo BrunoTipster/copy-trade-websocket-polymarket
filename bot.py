@@ -1,25 +1,11 @@
 """
-Copy Trade Bot - Polymarket → Telegram
-Arquitetura híbrida: WebSocket (detecção) + REST (detalhes)
-
-Fluxo:
-  1. Warmup REST: carrega trades existentes de todas as wallets
-  2. REST polling leve (30s) como fallback
-  3. WebSocket market channel: assina os asset_ids das posições abertas
-     → quando detecta last_trade_price, dispara verificação REST imediata
-  4. Envia sinal no Telegram com todos os detalhes
+Seoul Weather Bot — Wunderground + Polymarket → Telegram
+Pega temperatura real via Selenium, % do mercado, previsão 5 dias.
 """
 
-import sys
-import os
-import requests
-import time
-import threading
-import json
-import websocket  # pip install websocket-client
-from datetime import datetime
+import os, json, re, time, requests
+from datetime import date, datetime, timedelta
 
-# Força output imediato no terminal
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 # ═══════════════════════════════════════════
@@ -28,99 +14,18 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 
 TELEGRAM_TOKEN   = "8744601987:AAFVTdhf2qyDE-OgooIesuHMd9PmhBGSIqo"
 TELEGRAM_CHAT_ID = "-1003910452966"
+INTERVALO        = 300  # 5 minutos
 
-INTERVALO_REST   = 8    # segundos entre polling REST completo
-MIN_VALOR        = 1.0  # ignora trades abaixo de $X
-MIN_CHANCE       = 5.0  # ignora trades com chance abaixo de X% (filtra spray/lixo)
-MIN_CHANCE_NO    = 5.0  # mínimo para apostas "No" também
+# Wunderground
+WU_TODAY = "https://www.wunderground.com/weather/kr/incheon/RKSI"
+WU_10DAY = "https://www.wunderground.com/forecast/kr/incheon/RKSI"
+WU_HIST  = "https://www.wunderground.com/history/daily/kr/incheon/RKSI"
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Polymarket Seoul
+POLY_SLUG_BASE = "highest-temperature-in-seoul-on-"
+GAMMA_API = "https://gamma-api.polymarket.com"
 
-DATA_API    = "https://data-api.polymarket.com"
-HEADERS     = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-}
-
-WALLETS = {
-    "0xf2f6af4f27ec2dcf4072095ab804016e14cd5817": "gopfan2 - CLIMA (#19)",
-    "0x44c1dfe43260c94ed4f1d00de2e1f80fb113ebc1": "aenews2 - POLÍTICA",
-    "0x6af75d4e4aaf700450efbac3708cce1665810ff1": "gopfan - CLIMA",
-    "0x594edb9112f526fa6a80b8f858a6379c8a2c1c11": "ColdMath (#2)",
-    "0xe5c8026239919339b988fdb150a7ef4ea196d3e7": "Anon-e5c8",
-    "0xee00ba338c59557141789b127927a55f5cc5cea1": "Anon-ee00",
-    "0x7f3c8979d0afa00007bae4747d5347122af05613": "LucasMeow",
-    "0xd3c55d67859f9e7102fe22f8ddf3b0c89170728f": "Bruno (principal)",
-    "0x1abbac62c40a33c91ed607307692182773f73020": "Bruno (proxy)",
-    "0x05e70727a2e2dcd079baa2ef1c0b88af06bb9641": "Handsanitizer23 (#1 +$74k)",
-    "0x15ceffed7bf820cd2d90f90ea24ae9909f5cd5fa": "HondaCivic (#3 +$32k)",
-    "0x1f66796b45581868376365aef54b51eb84184c8d": "Maskache2 (#4 +$31k)",
-    "0x331bf91c132af9d921e1908ca0979363fc47193f": "BeefSlayer (#5 +$28k)",
-    "0xb40e89677d59665d5188541ad860450a6e2a7cc9": "Poligarch (#8 +$25k)",
-    "0xf1faf3f6ad1e0264d6cbecc1a416e7c536be047d": "Kyrgyzhydromet (#9 +$23k)",
-    "0x1cdd071bb612de6d66d0c882b676c663697de595": "Lavincey (#10 +$22k)",
-    "0x1838cca016850ac7185a9b149fe7d0bd2d6629b4": "JoeTheMeteorologist (#16 +$17k)",
-    "0x5f211a24da4c005d9438a1ea269673b85ed0b376": "dpnd (#15 +$18k)",
-    "0x43cb4ae1f4ddc9e671486c79c9f40a6fd98b84df": "Trader #13 (+$20k)",
-    "0x46745788e678a6f8ceebcd8bc7e37462b74703ca": "speeda (#14 +$20k)",
-}
-
-# ═══════════════════════════════════════════
-#  ESTADO GLOBAL
-# ═══════════════════════════════════════════
-
-trades_enviados    = set()   # tx hashes já enviados
-activities_enviadas = set()  # redemptions já enviadas
-posicoes_abertas   = {}      # conditionId → {wallet, outcome, price, size, ...}
-asset_ids_ativos   = set()   # asset_ids das posições abertas (para WS)
-
-# Fila de asset_ids que o WS sinalizou como "teve trade agora"
-ws_triggered       = set()
-ws_lock            = threading.Lock()
-
-# ── Estatísticas WIN/LOSS (resetam a cada 30min) ──
-STATS_FILE = "stats.json"
-stats_periodo = {"wins": 0, "losses": 0, "lucro": 0.0, "inicio": time.time()}
-
-
-def stats_salvar():
-    """Salva stats do período no JSON."""
-    try:
-        historico = []
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, "r") as f:
-                historico = json.load(f)
-        historico.append({
-            "inicio": datetime.fromtimestamp(stats_periodo["inicio"]).strftime("%d/%m %H:%M"),
-            "fim": datetime.now().strftime("%d/%m %H:%M"),
-            "wins": stats_periodo["wins"],
-            "losses": stats_periodo["losses"],
-            "lucro": round(stats_periodo["lucro"], 2),
-        })
-        # Guarda só os últimos 48 períodos (24h)
-        with open(STATS_FILE, "w") as f:
-            json.dump(historico[-48:], f, indent=2)
-    except Exception as e:
-        print(f"[ERRO] stats_salvar: {e}")
-
-
-def stats_resetar():
-    """Salva e reseta as stats do período."""
-    global stats_periodo
-    stats_salvar()
-    stats_periodo = {"wins": 0, "losses": 0, "lucro": 0.0, "inicio": time.time()}
-
-
-def stats_registrar(resultado, lucro):
-    """Registra um WIN ou LOSS."""
-    if resultado == "WIN":
-        stats_periodo["wins"] += 1
-    else:
-        stats_periodo["losses"] += 1
-    stats_periodo["lucro"] += lucro
-
-# WebSocket app global
-ws_app = None
+H_API = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
 # ═══════════════════════════════════════════
@@ -128,560 +33,326 @@ ws_app = None
 # ═══════════════════════════════════════════
 
 def enviar(msg):
-    for attempt in range(3):
+    for _ in range(3):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": msg,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=10,
-            )
-            data = r.json()
-            if data.get("ok"):
-                return True
-            retry = data.get("parameters", {}).get("retry_after", 0)
-            if retry:
-                time.sleep(retry + 1)
-                continue
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                      "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=10)
+            if r.json().get("ok"): return True
+            rt = r.json().get("parameters", {}).get("retry_after", 0)
+            if rt: time.sleep(rt + 1); continue
             # Fallback sem HTML
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=10,
-            )
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
             return True
         except Exception as e:
-            print(f"[ERRO] Telegram: {e}")
-            time.sleep(2)
+            print(f"[TG] {e}"); time.sleep(2)
     return False
 
 
 # ═══════════════════════════════════════════
-#  API POLYMARKET
+#  SELENIUM — Wunderground
 # ═══════════════════════════════════════════
 
-def buscar_trades(wallet, limit=20):
+_driver = None
+
+def get_driver():
+    """Cria driver Chrome headless."""
+    global _driver
+    if _driver:
+        return _driver
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--lang=en-US")
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+    _driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=opts
+    )
+    _driver.implicitly_wait(10)
+    return _driver
+
+
+def buscar_temp_wunderground():
+    """Pega temperatura atual + máxima de hoje do Wunderground via Selenium."""
     try:
-        r = requests.get(
-            f"{DATA_API}/trades",
-            params={"user": wallet, "limit": limit},
-            headers=HEADERS, timeout=15,
-        )
-        r.raise_for_status()
-        return r.json() or []
+        driver = get_driver()
+        driver.get(WU_TODAY)
+        time.sleep(5)
+
+        html = driver.page_source
+
+        # Temperatura atual
+        temp_atual = None
+        m = re.search(r'class="current-temp"[^>]*>.*?(\d+)\s*°', html, re.S)
+        if m:
+            temp_atual = int(m.group(1))
+
+        # Máxima/Mínima do dia
+        temp_max = temp_min = None
+        m = re.search(r'HIGH\s*(\d+)\s*°\s*C', html, re.I)
+        if m: temp_max = int(m.group(1))
+        m = re.search(r'LOW\s*(\d+)\s*°\s*C', html, re.I)
+        if m: temp_min = int(m.group(1))
+
+        # Fallback: pega do texto geral
+        if not temp_atual:
+            m = re.search(r'"temperature"[^}]*"value"\s*:\s*([\d.]+)', html)
+            if m: temp_atual = round(float(m.group(1)))
+
+        print(f"[WU] Atual: {temp_atual}°C | Max: {temp_max}°C | Min: {temp_min}°C")
+        return {"atual": temp_atual, "max": temp_max, "min": temp_min}
+
     except Exception as e:
-        print(f"[ERRO] trades {wallet[:10]}: {e}")
+        print(f"[WU] Erro: {e}")
+        return {"atual": None, "max": None, "min": None}
+
+
+def buscar_previsao_5dias():
+    """Pega previsão 5 dias do Wunderground via Selenium."""
+    try:
+        driver = get_driver()
+        driver.get(WU_10DAY)
+        time.sleep(5)
+
+        html = driver.page_source
+        previsao = []
+
+        # Padrão: datas com max/min
+        # Busca blocos de previsão diária
+        dias = re.findall(
+            r'(\d{1,2}/\d{2}).*?(\d+)°\s*\|\s*(\d+)°\s*C',
+            html, re.S
+        )
+
+        if not dias:
+            # Fallback: Open-Meteo
+            return buscar_previsao_openmeteo()
+
+        for d, mx, mn in dias[:5]:
+            previsao.append({"data": d, "max": int(mx), "min": int(mn)})
+
+        return previsao
+
+    except Exception as e:
+        print(f"[WU 10day] Erro: {e}")
+        return buscar_previsao_openmeteo()
+
+
+def buscar_previsao_openmeteo():
+    """Fallback: previsão via Open-Meteo (gratuito, sem Selenium)."""
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast",
+            params={"latitude": 37.46, "longitude": 126.44,
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "timezone": "Asia/Seoul", "forecast_days": 6},
+            timeout=10)
+        d = r.json().get("daily", {})
+        datas = d.get("time", [])
+        maxs = d.get("temperature_2m_max", [])
+        mins = d.get("temperature_2m_min", [])
+        prev = []
+        for i in range(min(5, len(datas))):
+            dt = datetime.strptime(datas[i], "%Y-%m-%d")
+            prev.append({
+                "data": dt.strftime("%d/%m"),
+                "max": round(maxs[i]),
+                "min": round(mins[i]),
+            })
+        return prev
+    except Exception as e:
+        print(f"[OM] Erro: {e}")
         return []
 
 
-def buscar_activities(wallet, limit=20):
+# ═══════════════════════════════════════════
+#  POLYMARKET — % por grau
+# ═══════════════════════════════════════════
+
+def buscar_polymarket_seoul(data_alvo):
+    """Busca outcomes e % do mercado de Seoul na Polymarket."""
+    meses = {1:"january",2:"february",3:"march",4:"april",5:"may",6:"june",
+             7:"july",8:"august",9:"september",10:"october",11:"november",12:"december"}
+    slug = f"{POLY_SLUG_BASE}{meses[data_alvo.month]}-{data_alvo.day}-{data_alvo.year}"
+
     try:
-        r = requests.get(
-            f"{DATA_API}/activity",
-            params={"user": wallet, "limit": limit},
-            headers=HEADERS, timeout=15,
-        )
-        r.raise_for_status()
-        return r.json() or []
-    except Exception as e:
-        print(f"[ERRO] activity {wallet[:10]}: {e}")
-        return []
+        r = requests.get(f"{GAMMA_API}/events",
+            params={"slug": slug}, headers=H_API, timeout=10)
+        events = r.json()
+        if not events:
+            return None, slug
 
+        ev = events[0]
+        outcomes = []
 
-# ═══════════════════════════════════════════
-#  TRADUÇÃO (Google Translate gratuito via requests)
-# ═══════════════════════════════════════════
+        for mkt in ev.get("markets", []):
+            q = mkt.get("question", "")
+            op = mkt.get("outcomePrices", "")
+            try:
+                prices = json.loads(op) if isinstance(op, str) else op
+                yes_price = float(prices[0])
+            except:
+                yes_price = 0
 
-_cache_trad = {}
-
-
-def f_para_c(f):
-    """Converte Fahrenheit para Celsius."""
-    return round((f - 32) * 5 / 9, 1)
-
-
-import re
-
-def adicionar_celsius(texto):
-    """Detecta temperaturas em °F e adiciona °C ao lado. Ex: 74-75°F → 74-75°F (23.3-23.9°C)"""
-    # Padrão: 74-75°F ou 74°F
-    def substituir_range(m):
-        f1 = float(m.group(1))
-        f2 = float(m.group(2))
-        c1 = f_para_c(f1)
-        c2 = f_para_c(f2)
-        return f"{int(f1)}-{int(f2)}°F ({c1}-{c2}°C)"
-
-    def substituir_single(m):
-        f = float(m.group(1))
-        c = f_para_c(f)
-        return f"{int(f)}°F ({c}°C)"
-
-    # Range: 74-75°F ou 74-75 °F ou 74-75F
-    texto = re.sub(r'(\d+)-(\d+)\s*°?\s*F\b', substituir_range, texto)
-    # Single: 90°F ou 90 °F ou 90F
-    texto = re.sub(r'(\d+)\s*°?\s*F\b', substituir_single, texto)
-    return texto
-
-def traduzir(texto):
-    """Traduz inglês → português usando API gratuita do Google Translate."""
-    if not texto or texto in ("?", "Yes", "No"):
-        return {"Yes": "Sim", "No": "Não"}.get(texto, texto)
-    if texto in _cache_trad:
-        return _cache_trad[texto]
-    try:
-        r = requests.get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "en", "tl": "pt", "dt": "t", "q": texto},
-            timeout=5,
-        )
-        result = r.json()[0]
-        trad = "".join(part[0] for part in result if part[0])
-        _cache_trad[texto] = trad
-        return trad
-    except Exception:
-        return texto
-
-
-# ═══════════════════════════════════════════
-#  FORMATAÇÃO
-# ═══════════════════════════════════════════
-
-def formatar_trade(t, nome):
-    side    = t.get("side", "?")
-    title   = t.get("title", "?")
-    outcome = t.get("outcome", "?")
-    price   = float(t.get("price", 0))
-    size    = float(t.get("size", 0))
-    slug    = t.get("eventSlug", "")
-    ts      = t.get("timestamp", 0)
-    tx      = t.get("transactionHash", "")
-    cid     = t.get("conditionId", "")
-    valor   = round(price * size, 2)
-    prob    = round(price * 100, 1)
-    dt      = datetime.fromtimestamp(ts).strftime("%d/%m %H:%M:%S") if ts else "?"
-
-    emoji = "\U0001f7e2" if side == "BUY" else "\U0001f534"
-    acao  = "COMPROU" if side == "BUY" else "VENDEU (SAIU)"
-    link  = f"https://polymarket.com/event/{slug}" if slug else ""
-
-    # Emoji do tipo de mercado baseado no título
-    title_low = title.lower()
-    if any(x in title_low for x in ["temperature", "weather", "rain", "snow", "wind", "celsius", "fahrenheit", "clima", "temperatura"]):
-        cat = "🌤️ Clima"
-    elif any(x in title_low for x in ["nhl", "hockey"]):
-        cat = "🏒 NHL"
-    elif any(x in title_low for x in ["mlb", "baseball"]):
-        cat = "⚾ MLB"
-    elif any(x in title_low for x in ["nba", "basketball"]):
-        cat = "🏀 NBA"
-    elif any(x in title_low for x in ["nfl", "american football"]):
-        cat = "🏈 NFL"
-    elif any(x in title_low for x in ["cricket", "ipl", "odi", "test match"]):
-        cat = "🏏 Cricket"
-    elif any(x in title_low for x in ["rugby", "six nations", "super rugby"]):
-        cat = "🏉 Rugby"
-    elif any(x in title_low for x in ["tennis", "atp", "wta", "wimbledon", "roland garros", "us open", "australian open"]):
-        cat = "🎾 Tennis"
-    elif any(x in title_low for x in ["soccer", "football", "premier league", "la liga", "serie a", "bundesliga", "champions league", "copa", "fifa", "mls", "ligue 1"]):
-        cat = "⚽ Futebol"
-    elif any(x in title_low for x in ["election", "president", "senate", "congress", "vote", "poll", "eleição"]):
-        cat = "🗳️ Política"
-    elif any(x in title_low for x in ["bitcoin", "btc", "eth", "crypto", "price"]):
-        cat = "₿ Crypto"
-    elif any(x in title_low for x in ["earthquake", "hurricane", "tornado", "flood", "disaster"]):
-        cat = "🌍 Geopolítica"
-    else:
-        cat = "📊 Geral"
-
-    # Traduz título e outcome
-    titulo_pt = adicionar_celsius(traduzir(title))
-    outcome_pt = traduzir(outcome)
-
-    # Monta mensagem resumida e clara
-    msg = f"{emoji} <b>{acao}</b> — {cat}\n"
-    msg += f"👤 <b>{nome}</b>\n\n"
-    msg += f"📌 <b>{titulo_pt}</b>\n"
-    msg += f"🎯 Entrou no: <b>{outcome_pt}</b> a <b>{prob}%</b>\n"
-    msg += f"💵 <b>${valor}</b> ({size:.1f} shares @ ${price})\n"
-    msg += f"🕐 {dt}\n"
-
-    if side == "SELL" and cid and cid in posicoes_abertas:
-        pos = posicoes_abertas[cid]
-        preco_entrada = float(pos.get("price", 0))
-        if preco_entrada > 0:
-            lucro_por_share = price - preco_entrada
-            lucro_total = round(lucro_por_share * size, 2)
-            pct = round((lucro_por_share / preco_entrada) * 100, 1)
-            if lucro_total >= 0:
-                msg += f"📈 <b>LUCRO: +${lucro_total} (+{pct}%)</b>\n"
-            else:
-                msg += f"📉 <b>PREJUÍZO: ${lucro_total} ({pct}%)</b>\n"
-            msg += f"💲 Entrada ${preco_entrada} → Saída ${price}\n"
-
-    if link:
-        msg += f"\n🔗 <a href=\"{link}\">Abrir mercado</a>"
-    if tx:
-        msg += f"  🔍 <a href=\"https://polygonscan.com/tx/{tx}\">Tx</a>"
-    return msg
-
-
-def formatar_resultado(a, nome, pos):
-    title   = a.get("title", "?")
-    outcome = a.get("outcome", "?")
-    usdc    = float(a.get("usdcSize", 0))
-    ts      = a.get("timestamp", 0)
-    slug    = a.get("eventSlug", "")
-    dt      = datetime.fromtimestamp(ts).strftime("%d/%m %H:%M:%S") if ts else "?"
-    custo   = round(float(pos.get("price", 0)) * float(pos.get("size", 0)), 2)
-
-    if usdc > 0 and custo > 0:
-        lucro = round(usdc - custo, 2)
-        if lucro >= 0:
-            emoji, resultado = "🏆", "WIN"
-            cor_resultado = "🟢🟢🟢 <b>WIN +$" + str(lucro) + "</b> 🟢🟢🟢"
-        else:
-            emoji, resultado = "💥", "LOSS"
-            cor_resultado = "🔴🔴🔴 <b>LOSS $" + str(lucro) + "</b> 🔴🔴🔴"
-    elif usdc > 0:
-        emoji, resultado, lucro = "🏆", "WIN", round(usdc, 2)
-        cor_resultado = "🟢🟢🟢 <b>WIN +$" + str(lucro) + "</b> 🟢🟢🟢"
-    else:
-        emoji, resultado, lucro = "💥", "LOSS", 0
-        cor_resultado = "🔴🔴🔴 <b>LOSS $0</b> 🔴🔴🔴"
-
-    # Registra nas stats do período
-    stats_registrar(resultado, lucro)
-
-    link = f"https://polymarket.com/event/{slug}" if slug else ""
-    msg = (
-        f"{cor_resultado}\n\n"
-        f"\U0001f464 <b>{nome}</b>\n"
-        f"\U0001f3af Mercado: <b>{adicionar_celsius(traduzir(title))}</b>\n"
-        f"\U0001f4cc Resultado: <b>{traduzir(outcome)}</b>\n\n"
-    )
-    if custo > 0:
-        msg += f"\U0001f4b0 Entrada: <b>${custo}</b>\n"
-    msg += (
-        f"\U0001f4b5 Recebeu: <b>${round(usdc, 2)}</b>\n"
-        f"\U0001f552 {dt}\n"
-    )
-    if link:
-        msg += f"\n\U0001f517 <a href=\"{link}\">Ver mercado</a>"
-    return msg, resultado, lucro
-
-
-# ═══════════════════════════════════════════
-#  PROCESSAMENTO DE TRADES
-# ═══════════════════════════════════════════
-
-def processar_trades_wallet(wallet, nome):
-    """Busca e processa trades novos de uma wallet."""
-    trades = buscar_trades(wallet)
-    for t in trades:
-        tx = t.get("transactionHash", "")
-        if not tx or tx in trades_enviados:
-            continue
-        trades_enviados.add(tx)
-
-        price = float(t.get("price", 0))
-        size  = float(t.get("size", 0))
-        if price * size < MIN_VALOR:
-            continue
-
-        msg = formatar_trade(t, nome)
-        side  = t.get("side", "?")
-        title = (t.get("title") or "?")[:50]
-        print(f"[NOVO] {nome}: {side} {title} — ${price*size:.2f}")
-        enviar(msg)
-
-        if side == "BUY":
-            cid = t.get("conditionId", "")
-            aid = t.get("asset", "")
-            if cid:
-                posicoes_abertas[cid] = {
-                    "wallet": wallet, "nome": nome,
-                    "outcome": t.get("outcome"),
-                    "price": price, "size": size,
-                    "title": t.get("title"),
-                    "slug": t.get("eventSlug"),
-                }
-            # Adiciona asset_id ao WS
-            if aid:
-                asset_ids_ativos.add(aid)
-                ws_subscribe([aid])
-
-        time.sleep(0.3)
-
-
-def checar_resultados():
-    """Checa redemptions (WIN/LOSS) de todas as wallets."""
-    for wallet, nome in WALLETS.items():
-        for a in buscar_activities(wallet):
-            tx   = a.get("transactionHash", "")
-            tipo = (a.get("type") or "").upper()
-            if "REDEEM" not in tipo or not tx or tx in activities_enviadas:
+            if yes_price < 0.005:
                 continue
-            activities_enviadas.add(tx)
-            cid = a.get("conditionId", "")
-            pos = posicoes_abertas.get(cid, {})
-            msg, resultado, lucro = formatar_resultado(a, nome, pos)
-            print(f"[{resultado}] {nome}: {a.get('title','?')} → ${lucro}")
-            enviar(msg)
-            posicoes_abertas.pop(cid, None)
-        time.sleep(0.05)
 
+            # Extrai grau do question
+            grau = "?"
+            m = re.search(r'be\s+(\d+)\s*°?\s*C', q, re.I)
+            if m:
+                grau = f"{m.group(1)}°C"
+            else:
+                m = re.search(r'between\s+(\d+)-(\d+)\s*°?\s*C', q, re.I)
+                if m:
+                    grau = f"{m.group(1)}-{m.group(2)}°C"
+                else:
+                    m = re.search(r'(\d+)\s*°?\s*C\s*or\s*(higher|below)', q, re.I)
+                    if m:
+                        sinal = "≥" if "higher" in m.group(2).lower() else "≤"
+                        grau = f"{sinal}{m.group(1)}°C"
 
-# ═══════════════════════════════════════════
-#  WEBSOCKET
-# ═══════════════════════════════════════════
+            outcomes.append({
+                "grau": grau,
+                "pct": round(yes_price * 100, 1),
+                "question": q,
+            })
 
-def ws_subscribe(asset_ids):
-    """Envia mensagem de subscribe para novos asset_ids."""
-    global ws_app
-    if not ws_app or not asset_ids:
-        return
-    try:
-        msg = json.dumps({
-            "assets_ids": list(asset_ids),
-            "operation": "subscribe",
-            "custom_feature_enabled": True,
-        })
-        ws_app.send(msg)
-        print(f"[WS] Subscrito em {len(asset_ids)} asset(s)")
-    except Exception as e:
-        print(f"[WS] Erro subscribe: {e}")
-
-
-def on_ws_message(ws, message):
-    """Processa mensagens do WebSocket."""
-    global ws_triggered
-    try:
-        if message in ("PONG", "pong"):
-            return
-
-        data = json.loads(message)
-
-        # Pode vir como lista ou dict
-        events = data if isinstance(data, list) else [data]
-
-        for event in events:
-            etype = event.get("event_type") or event.get("type") or ""
-
-            # last_trade_price = alguém acabou de fazer uma trade nesse mercado
-            if etype == "last_trade_price":
-                asset_id = event.get("asset_id", "")
-                price    = event.get("price", "?")
-                print(f"[WS] Trade detectada! asset={asset_id[:16]}... price={price}")
-                with ws_lock:
-                    ws_triggered.add(asset_id)
+        outcomes.sort(key=lambda x: x["pct"], reverse=True)
+        return outcomes, slug
 
     except Exception as e:
-        print(f"[WS] Erro parse: {e}")
-
-
-def on_ws_open(ws):
-    global ws_app
-    ws_app = ws
-    print(f"[WS] Conectado → {WS_URL}")
-
-    # Subscreve nos asset_ids já conhecidos
-    if asset_ids_ativos:
-        msg = json.dumps({
-            "assets_ids": list(asset_ids_ativos),
-            "type": "market",
-            "custom_feature_enabled": True,
-        })
-        ws.send(msg)
-        print(f"[WS] Subscrito em {len(asset_ids_ativos)} assets existentes")
-    else:
-        # Sem assets ainda, manda mensagem vazia para não ser desconectado
-        ws.send(json.dumps({"type": "market", "assets_ids": [], "custom_feature_enabled": True}))
-
-
-def on_ws_error(ws, error):
-    print(f"[WS] Erro: {error}")
-
-
-def on_ws_close(ws, code, msg):
-    print(f"[WS] Desconectado (code={code}). Reconectando em 5s...")
-    time.sleep(5)
-    iniciar_websocket()
-
-
-def heartbeat_loop(ws):
-    """Envia PING a cada 10s para manter conexão viva."""
-    while True:
-        time.sleep(10)
-        try:
-            if ws and ws.sock and ws.sock.connected:
-                ws.send("PING")
-        except Exception:
-            break
-
-
-def iniciar_websocket():
-    """Inicia WebSocket em thread separada."""
-    def run():
-        app = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_ws_open,
-            on_message=on_ws_message,
-            on_error=on_ws_error,
-            on_close=on_ws_close,
-        )
-        # Inicia heartbeat em thread separada
-        hb = threading.Thread(target=heartbeat_loop, args=(app,), daemon=True)
-        hb.start()
-        app.run_forever(ping_interval=0)  # ping manual via heartbeat
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    print("[WS] Thread iniciada")
+        print(f"[POLY] Erro: {e}")
+        return None, slug
 
 
 # ═══════════════════════════════════════════
-#  WARMUP
+#  FORMATAR MENSAGEM
 # ═══════════════════════════════════════════
 
-def warmup():
-    print("[INFO] Carregando trades existentes...")
-    total = 0
-    for wallet, nome in WALLETS.items():
-        trades = buscar_trades(wallet, limit=50)
-        for t in trades:
-            tx = t.get("transactionHash", "")
-            if tx:
-                trades_enviados.add(tx)
-                total += 1
-            if t.get("side") == "BUY":
-                cid = t.get("conditionId", "")
-                aid = t.get("asset", "")
-                if cid:
-                    posicoes_abertas[cid] = {
-                        "wallet": wallet, "nome": nome,
-                        "outcome": t.get("outcome"),
-                        "price": t.get("price", 0),
-                        "size": t.get("size", 0),
-                        "title": t.get("title"),
-                        "slug": t.get("eventSlug"),
-                    }
-                if aid:
-                    asset_ids_ativos.add(aid)
+def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo):
+    """Monta mensagem completa pro Telegram."""
+    link = f"https://polymarket.com/event/{slug}"
 
-        for a in buscar_activities(wallet, limit=50):
-            tx = a.get("transactionHash", "")
-            if tx:
-                activities_enviadas.add(tx)
+    msg = "🇰🇷 <b>SEOUL — Temperatura</b>\n"
+    msg += f"📅 {data_alvo.strftime('%d/%m/%Y')}\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        time.sleep(0.1)
+    # Temperatura atual
+    if temp.get("atual"):
+        msg += f"🌡️ <b>Agora: {temp['atual']}°C</b> (Wunderground RKSI)\n"
+    if temp.get("max"):
+        msg += f"📈 Máxima hoje: <b>{temp['max']}°C</b> | Mínima: {temp.get('min','?')}°C\n"
+    msg += "\n"
 
-    print(f"[OK] {total} trades | {len(posicoes_abertas)} posições | {len(asset_ids_ativos)} assets para WS")
+    # Top 3 do mercado
+    if outcomes:
+        msg += "📊 <b>TOP 3 Polymarket:</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        for i, o in enumerate(outcomes[:3], 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
+            msg += f"{medal} <b>{o['grau']}</b> → <b>{o['pct']}%</b>\n"
+        msg += "\n"
+
+        # Todas as opções
+        msg += "📋 <b>Todas as opções:</b>\n"
+        for o in outcomes:
+            bar = "█" * int(o["pct"] / 5) + "░" * (20 - int(o["pct"] / 5))
+            msg += f"  {o['grau']:<8} {bar} {o['pct']}%\n"
+        msg += "\n"
+
+    # Previsão 5 dias
+    if previsao:
+        msg += "📅 <b>Previsão 5 dias (Seoul):</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        for p in previsao[:5]:
+            msg += f"  {p['data']} → 🔺{p['max']}°C  🔻{p['min']}°C\n"
+        msg += "\n"
+
+    msg += f"🔗 <a href=\"{link}\">Abrir no Polymarket</a>\n"
+    msg += f"📡 <a href=\"https://www.wunderground.com/weather/kr/incheon/RKSI\">Wunderground RKSI</a>"
+
+    return msg
 
 
 # ═══════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════
 
+def executar():
+    """Executa uma varredura completa."""
+    print(f"\n{'='*50}")
+    print(f"  VARREDURA {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"{'='*50}")
+
+    hoje = date.today()
+
+    # 1. Temperatura atual do Wunderground
+    print("[1] Buscando temperatura Wunderground...")
+    temp = buscar_temp_wunderground()
+
+    # 2. Polymarket — mercado de hoje
+    print("[2] Buscando Polymarket Seoul...")
+    outcomes, slug = buscar_polymarket_seoul(hoje)
+    if outcomes:
+        print(f"    Top 3: {', '.join(f'{o[\"grau\"]}={o[\"pct\"]}%' for o in outcomes[:3])}")
+    else:
+        print("    Sem mercado para hoje")
+
+    # 3. Previsão 5 dias
+    print("[3] Buscando previsão 5 dias...")
+    previsao = buscar_previsao_5dias()
+    if previsao:
+        print(f"    {', '.join(f'{p[\"data\"]}:{p[\"max\"]}°C' for p in previsao[:5])}")
+
+    # 4. Formata e envia
+    msg = formatar_mensagem(temp, outcomes, slug, previsao, hoje)
+    enviar(msg)
+    print("[OK] Mensagem enviada!")
+
+
 def main():
-    print("=" * 52)
-    print("  POLYMARKET COPY TRADE BOT  (WS + REST)")
-    print(f"  Wallets: {len(WALLETS)} | Polling: {INTERVALO_REST}s")
-    print("=" * 52)
+    print("╔══════════════════════════════════════════╗")
+    print("║  SEOUL WEATHER BOT — WU + Polymarket     ║")
+    print("║  Selenium + Gamma API + Open-Meteo       ║")
+    print(f"║  Intervalo: {INTERVALO//60} min                        ║")
+    print("╚══════════════════════════════════════════╝")
 
-    # 1. Warmup
-    warmup()
-
-    # 2. Inicia WebSocket
-    iniciar_websocket()
-    time.sleep(2)  # aguarda conexão
-
-    # 3. Startup Telegram
-    nomes = "\n".join(f"  • {n}" for n in WALLETS.values())
     enviar(
-        f"\U0001f916 <b>Copy Trade Bot Ativo!</b>\n\n"
-        f"Monitorando <b>{len(WALLETS)}</b> wallets:\n{nomes}\n\n"
-        f"\u26a1 WebSocket ativo\n"
-        f"\u23f1 Polling REST: {INTERVALO_REST}s"
+        "🤖 <b>Seoul Weather Bot Ativo!</b>\n\n"
+        "📡 Wunderground RKSI (Selenium)\n"
+        "📊 Polymarket Seoul\n"
+        "🌐 Open-Meteo previsão\n\n"
+        f"⏱️ Atualiza a cada {INTERVALO//60} min"
     )
-    print(f"[OK] Bot pronto!")
 
-    ciclo = 0
     while True:
-        time.sleep(INTERVALO_REST)
-        ciclo += 1
+        try:
+            executar()
+        except KeyboardInterrupt:
+            print("\n[INFO] Encerrado.")
+            break
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[ERRO] {e}")
+            time.sleep(30)
 
-        # ── WS trigger: verifica wallets cujos assets tiveram trade ──
-        triggered = set()
-        with ws_lock:
-            triggered = ws_triggered.copy()
-            ws_triggered.clear()
-
-        if triggered:
-            print(f"[WS] {len(triggered)} asset(s) com trade detectado → verificando wallets...")
-            # Descobre quais wallets têm posição nesses assets
-            wallets_para_checar = set()
-            for cid, pos in posicoes_abertas.items():
-                wallets_para_checar.add((pos["wallet"], pos["nome"]))
-            # Também checa todas (o WS não diz quem fez, só que houve trade)
-            for wallet, nome in WALLETS.items():
-                processar_trades_wallet(wallet, nome)
-        else:
-            # ── REST polling normal ──
-            for wallet, nome in WALLETS.items():
-                processar_trades_wallet(wallet, nome)
-                time.sleep(0.05)
-
-        # A cada 30s checa WIN/LOSS
-        if ciclo % (30 // INTERVALO_REST) == 0:
-            checar_resultados()
-
-        # A cada 30 minutos: envia relatório, salva JSON e reseta
-        if ciclo % (1800 // INTERVALO_REST) == 0:
-            w = stats_periodo["wins"]
-            l = stats_periodo["losses"]
-            lucro = round(stats_periodo["lucro"], 2)
-            total = w + l
-            taxa = round((w / total * 100), 1) if total > 0 else 0
-            inicio = datetime.fromtimestamp(stats_periodo["inicio"]).strftime("%H:%M")
-            agora = datetime.now().strftime("%H:%M")
-
-            if lucro >= 0:
-                lucro_str = f"🟢 +${lucro}"
-            else:
-                lucro_str = f"🔴 ${lucro}"
-
-            relatorio = (
-                f"📊 <b>RELATÓRIO 30 MIN</b> ({inicio} → {agora})\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🏆 Wins: <b>{w}</b>\n"
-                f"💥 Losses: <b>{l}</b>\n"
-                f"📈 Taxa de acerto: <b>{taxa}%</b>\n"
-                f"💵 Lucro/Prejuízo: <b>{lucro_str}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"💾 Salvo em stats.json"
-            )
-            enviar(relatorio)
-            print(f"[STATS] W:{w} L:{l} Lucro:${lucro} → salvo e resetado")
-            stats_resetar()
-
-        # Log periódico
-        if ciclo % 60 == 0:
-            print(f"[INFO] Ciclo {ciclo} | Trades: {len(trades_enviados)} | "
-                  f"Posições: {len(posicoes_abertas)} | WS assets: {len(asset_ids_ativos)}")
+        print(f"\n[AGUARDANDO {INTERVALO}s]")
+        time.sleep(INTERVALO)
 
 
 if __name__ == "__main__":
-    print("Iniciando bot...", flush=True)
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[INFO] Bot encerrado.")
-    except Exception as e:
-        import traceback
-        print(f"[FATAL] {e}", flush=True)
-        traceback.print_exc()
+    main()
