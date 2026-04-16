@@ -33,6 +33,8 @@ import time
 import json
 import re
 import math
+import threading
+import websocket  # pip install websocket-client
 from datetime import datetime, date, timedelta, timezone
 
 # ══════════════════════════════════════════════
@@ -149,6 +151,112 @@ _cache_pm   = {}   # cache preços Polymarket
 alertas_env = set()
 precos_ant  = {}   # { "chave": preco_anterior } para detectar valorização
 
+# ══════════════════════════════════════════════
+#  WEBSOCKET — Polymarket tempo real
+# ══════════════════════════════════════════════
+
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+ws_app = None
+ws_asset_ids = set()       # asset_ids subscritos
+ws_odds_changed = set()    # asset_ids que tiveram mudança de odds
+ws_lock = threading.Lock()
+
+
+def ws_subscribe(asset_ids):
+    """Subscreve em novos asset_ids no WebSocket."""
+    global ws_app
+    if not ws_app or not asset_ids:
+        return
+    try:
+        msg = json.dumps({
+            "assets_ids": list(asset_ids),
+            "operation": "subscribe",
+            "custom_feature_enabled": True,
+        })
+        ws_app.send(msg)
+        ws_asset_ids.update(asset_ids)
+    except Exception as e:
+        print(f"  [WS] Erro subscribe: {e}")
+
+
+def on_ws_message(ws, message):
+    if message in ("PONG", "pong"):
+        return
+    try:
+        data = json.loads(message)
+        events = data if isinstance(data, list) else [data]
+        for ev in events:
+            etype = ev.get("event_type") or ev.get("type") or ""
+            if etype in ("last_trade_price", "price_change", "book"):
+                asset_id = ev.get("asset_id", "")
+                if asset_id:
+                    with ws_lock:
+                        ws_odds_changed.add(asset_id)
+    except Exception:
+        pass
+
+
+def on_ws_open(ws):
+    global ws_app
+    ws_app = ws
+    print(f"  [WS] Conectado → {WS_URL}")
+    if ws_asset_ids:
+        ws.send(json.dumps({
+            "assets_ids": list(ws_asset_ids),
+            "type": "market",
+            "custom_feature_enabled": True,
+        }))
+        print(f"  [WS] Subscrito em {len(ws_asset_ids)} assets")
+    else:
+        ws.send(json.dumps({"type": "market", "assets_ids": [], "custom_feature_enabled": True}))
+
+
+def on_ws_error(ws, error):
+    print(f"  [WS] Erro: {error}")
+
+
+def on_ws_close(ws, code, msg):
+    print(f"  [WS] Desconectado (code={code}). Reconectando em 5s...")
+    time.sleep(5)
+    iniciar_websocket()
+
+
+def heartbeat_ws(ws):
+    while True:
+        time.sleep(10)
+        try:
+            if ws and ws.sock and ws.sock.connected:
+                ws.send("PING")
+        except Exception:
+            break
+
+
+def iniciar_websocket():
+    def run():
+        app = websocket.WebSocketApp(
+            WS_URL,
+            on_open=on_ws_open,
+            on_message=on_ws_message,
+            on_error=on_ws_error,
+            on_close=on_ws_close,
+        )
+        hb = threading.Thread(target=heartbeat_ws, args=(app,), daemon=True)
+        hb.start()
+        app.run_forever(ping_interval=0)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    print("  [WS] Thread iniciada")
+
+
+def ws_check_changes() -> bool:
+    """Retorna True se houve mudança de odds desde última checagem."""
+    with ws_lock:
+        changed = len(ws_odds_changed) > 0
+        ws_odds_changed.clear()
+        return changed
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -193,13 +301,22 @@ def cidades_prioritarias() -> list:
         return ["tokyo", "seoul", "hong kong", "wellington"]
 
 def data_mercado() -> date:
-    """Data do mercado a monitorar: hoje de manhã, amanhã à noite."""
+    """
+    Data do mercado a monitorar.
+    Busca HOJE e AMANHÃ — retorna o que tiver mercado ativo.
+    Se hoje já resolveu, busca amanhã.
+    """
     h = hora_brt()
     hoje = date.today()
-    # Janela 19h–02h → mercados de amanhã (ainda não resolvidos)
-    if h >= 19:
-        return hoje + timedelta(days=1)
-    return hoje
+    amanha = hoje + timedelta(days=1)
+
+    # Tenta hoje primeiro — se não achar mercado, usa amanhã
+    # Na prática: mercados de hoje resolvem ~18h local da cidade
+    # Então de manhã BRT ainda pode ter mercados de hoje abertos (Ásia/Europa)
+    # Mas à noite BRT, só amanhã tem mercados novos
+
+    # Retorna ambos para o bot tentar os dois
+    return amanha  # prioriza amanhã (mercados mais frescos)
 
 # ══════════════════════════════════════════════
 #  TELEGRAM
@@ -331,52 +448,51 @@ def previsao_hko() -> float | None:
 # ══════════════════════════════════════════════
 
 def buscar_mercados_polymarket(data_alvo: date) -> list:
-    """Busca mercados de temperatura abertos para a data alvo."""
+    """Busca mercados de temperatura abertos para a data alvo via slug direto."""
     ck = f"pm|{data_alvo}"
     if ck in _cache_pm:
         return _cache_pm[ck]
 
-    mercados = []
-    data_str = data_alvo.strftime("%B").lower() + " " + str(data_alvo.day)  # ex: "april 17"
+    # Constrói slugs para cada cidade
+    mes = data_alvo.strftime("%B").lower()  # "april"
+    dia = data_alvo.day                      # 17
+    ano = data_alvo.year                     # 2026
+    ds = f"{mes}-{dia}-{ano}"               # "april-17-2026"
 
-    for tag in ["temperature", "weather"]:
+    slug_map = {
+        "london":    f"highest-temperature-in-london-on-{ds}",
+        "tokyo":     f"highest-temperature-in-tokyo-on-{ds}",
+        "seoul":     f"highest-temperature-in-seoul-on-{ds}",
+        "hong kong": f"highest-temperature-in-hong-kong-on-{ds}",
+        "new york":  f"highest-temperature-in-nyc-on-{ds}",
+        "sao paulo": f"highest-temperature-in-sao-paulo-on-{ds}",
+        "wellington":f"highest-temperature-in-wellington-on-{ds}",
+    }
+
+    mercados = []
+    for cidade_key, slug in slug_map.items():
+        if cidade_key not in CIDADES:
+            continue
         try:
             r = requests.get(
                 "https://gamma-api.polymarket.com/events",
-                params={
-                    "tag":    tag,
-                    "active": "true",
-                    "closed": "false",
-                    "limit":  200,
-                },
-                headers=HEADERS, timeout=15,
+                params={"slug": slug},
+                headers=HEADERS, timeout=10,
             )
             if r.status_code == 200:
-                dados = r.json()
-                lista = dados if isinstance(dados, list) else dados.get("events", [])
-                mercados.extend(lista)
+                events = r.json()
+                if events and isinstance(events, list) and len(events) > 0:
+                    ev = events[0]
+                    ev["_cidade_key"] = cidade_key
+                    mercados.append(ev)
+                    print(f"  [PM] ✅ {cidade_key}: {len(ev.get('markets',[]))} sub-mercados")
         except Exception as e:
-            print(f"  [PM] {e}")
-        time.sleep(0.3)
+            print(f"  [PM] ❌ {cidade_key}: {e}")
+        time.sleep(0.2)
 
-    # Filtra por data e "temperature in"
-    resultado = []
-    vistos = set()
-    for m in mercados:
-        titulo = (m.get("title") or m.get("name") or m.get("question") or "").lower()
-        if "highest temperature in" not in titulo:
-            continue
-        if data_str not in titulo:
-            continue
-        cid = m.get("conditionId") or m.get("id") or m.get("slug", "")
-        if cid in vistos:
-            continue
-        vistos.add(cid)
-        resultado.append(m)
-
-    _cache_pm[ck] = resultado
-    print(f"  [PM] {len(resultado)} mercados para {data_alvo}")
-    return resultado
+    print(f"  [PM] {len(mercados)} mercados para {data_alvo}")
+    _cache_pm[ck] = mercados
+    return mercados
 
 def extrair_cidade_titulo(titulo: str) -> str | None:
     m = re.search(r"highest temperature in (.+?) on ", titulo.lower())
@@ -623,11 +739,10 @@ def executar_varredura():
 
     for raw in mercados:
         titulo = (raw.get("title") or raw.get("name") or "").strip()
-        if not titulo:
-            continue
 
-        cidade_key = extrair_cidade_titulo(titulo)
-        if cidade_key not in CIDADES:
+        # Usa _cidade_key se disponível (busca por slug), senão extrai do título
+        cidade_key = raw.get("_cidade_key") or extrair_cidade_titulo(titulo)
+        if not cidade_key or cidade_key not in CIDADES:
             continue
 
         cfg      = CIDADES[cidade_key]
@@ -636,6 +751,11 @@ def executar_varredura():
 
         if not outcomes:
             continue
+
+        # Subscreve token_ids no WebSocket
+        new_ids = [o["token_id"] for o in outcomes if o.get("token_id") and o["token_id"] not in ws_asset_ids]
+        if new_ids:
+            ws_subscribe(new_ids)
 
         total += 1
         print(f"  → {cfg['nome']:<20}", end=" | ")
@@ -747,25 +867,51 @@ def msg_startup() -> str:
 
 def main():
     print("╔══════════════════════════════════════════════════╗")
-    print("║   POLYMARKET WEATHER EDGE BOT  v3.0             ║")
-    print("║   Top 7 cidades · Fontes oficiais · BRT smart   ║")
+    print("║   POLYMARKET WEATHER EDGE BOT  v3.0 + WS        ║")
+    print("║   Top 7 cidades · WebSocket tempo real           ║")
     print(f"║   Edge mín: {MIN_EDGE}%  |  Intervalo: {INTERVALO_MIN} min             ║")
     print("╚══════════════════════════════════════════════════╝\n")
+
+    # Inicia WebSocket
+    iniciar_websocket()
+    time.sleep(2)
 
     telegram(msg_startup())
     print("[OK] Mensagem de startup enviada ao Telegram\n")
 
     ciclo = 0
+    ultimo_scan = 0
+
     while True:
         try:
+            time.sleep(10)  # checa a cada 10s
             ciclo += 1
-            executar_varredura()
+            agora = time.time()
+
+            # WebSocket detectou mudança de odds → limpa cache PM e faz scan
+            odds_mudaram = ws_check_changes()
+
+            # Scan completo a cada INTERVALO_MIN ou quando odds mudam
+            tempo_desde_scan = agora - ultimo_scan
+            fazer_scan = (tempo_desde_scan >= INTERVALO_MIN * 60) or (odds_mudaram and tempo_desde_scan >= 30)
+
+            if fazer_scan:
+                if odds_mudaram:
+                    print(f"\n  [WS] ⚡ Odds mudaram! Varredura imediata...")
+                _cache_pm.clear()  # força buscar dados frescos
+                executar_varredura()
+                ultimo_scan = agora
 
             # Limpa cache a cada 6 horas
-            if ciclo % (360 // INTERVALO_MIN) == 0:
+            if ciclo % (2160) == 0:  # 2160 * 10s = 6h
                 _cache_om.clear()
                 _cache_pm.clear()
                 print("[INFO] Cache limpo")
+
+            # Log a cada 60s
+            if ciclo % 6 == 0 and not fazer_scan:
+                ws_count = len(ws_asset_ids)
+                print(f"  [{datetime.now().strftime('%H:%M:%S')}] WS: {ws_count} assets | Próximo scan em {int(INTERVALO_MIN*60 - tempo_desde_scan)}s")
 
         except KeyboardInterrupt:
             print("\n[INFO] Encerrado pelo usuário.")
@@ -782,9 +928,6 @@ def main():
             )
             time.sleep(60)
             continue
-
-        print(f"[AGUARDANDO {INTERVALO_MIN} min]\n")
-        time.sleep(INTERVALO_MIN * 60)
 
 
 if __name__ == "__main__":
