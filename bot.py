@@ -306,19 +306,31 @@ def buscar_polymarket_seoul(data_alvo):
 #  FORMATAR MENSAGEM
 # ═══════════════════════════════════════════
 
-def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo, modelos=None):
-    """Monta mensagem completa pro Telegram."""
-    link = f"https://polymarket.com/event/{slug}"
+def c_para_f(c):
+    """Celsius → Fahrenheit."""
+    return round(c * 9 / 5 + 32, 1)
+
+
+def formatar_mensagem(temp, outcomes_amanha, slug_amanha, previsao, data_alvo, modelos=None):
+    """Monta mensagem completa pro Telegram. TOP 3 sempre do dia seguinte."""
+    amanha = date.today() + timedelta(days=1)
+    link = f"https://polymarket.com/event/{slug_amanha}" if slug_amanha else ""
 
     msg = "🇰🇷 <b>SEOUL — Temperatura</b>\n"
-    msg += f"📅 {data_alvo.strftime('%d/%m/%Y')}\n"
+    msg += f"📅 Hoje: {data_alvo.strftime('%d/%m/%Y')}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    # Temperatura atual
+    # Temperatura atual — °C e °F
     if temp.get("atual"):
-        msg += f"🌡️ <b>Agora: {temp['atual']}°C</b> (Wunderground RKSI)\n"
+        c = temp["atual"]
+        f = c_para_f(c)
+        msg += f"🌡️ <b>Agora: {c}°C / {f}°F</b> (Wunderground RKSI)\n"
     if temp.get("max"):
-        msg += f"📈 Máxima hoje: <b>{temp['max']}°C</b> | Mínima: {temp.get('min','?')}°C\n"
+        c_max = temp["max"]
+        c_min = temp.get("min", "?")
+        f_max = c_para_f(c_max) if isinstance(c_max, (int, float)) else "?"
+        f_min = c_para_f(c_min) if isinstance(c_min, (int, float)) else "?"
+        msg += f"📈 Máxima hoje: <b>{c_max}°C ({f_max}°F)</b> | Mínima: {c_min}°C ({f_min}°F)\n"
     msg += "\n"
 
     # Modelos para AMANHÃ
@@ -327,38 +339,43 @@ def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo, modelos=None):
         msg += f"🔮 <b>PREVISÃO AMANHÃ ({amanha_dt.strftime('%d/%m')}):</b>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
         if modelos.get("ecmwf"):
-            msg += f"  🇪🇺 ECMWF: <b>{modelos['ecmwf']}°C</b>\n"
+            ec = modelos["ecmwf"]
+            msg += f"  🇪🇺 ECMWF: <b>{ec}°C ({c_para_f(ec)}°F)</b>\n"
         if modelos.get("gfs"):
-            msg += f"  🇺🇸 GFS: <b>{modelos['gfs']}°C</b>\n"
+            gf = modelos["gfs"]
+            msg += f"  🇺🇸 GFS: <b>{gf}°C ({c_para_f(gf)}°F)</b>\n"
         if modelos.get("best"):
-            msg += f"  🌐 Best Match: <b>{modelos['best']}°C</b>\n"
-        msg += f"  📊 Média: <b>{modelos['media']}°C</b>\n\n"
+            bm = modelos["best"]
+            msg += f"  🌐 Best Match: <b>{bm}°C ({c_para_f(bm)}°F)</b>\n"
+        med = modelos["media"]
+        msg += f"  📊 Média: <b>{med}°C ({c_para_f(med)}°F)</b>\n\n"
 
-    # Top 3 do mercado
-    if outcomes:
-        msg += "📊 <b>TOP 3 Polymarket:</b>\n"
+    # TOP 3 Polymarket — SEMPRE do dia seguinte
+    if outcomes_amanha:
+        msg += f"📊 <b>TOP 3 Polymarket ({amanha.strftime('%d/%m')}):</b>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        for i, o in enumerate(outcomes[:3], 1):
+        for i, o in enumerate(outcomes_amanha[:3], 1):
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
             msg += f"{medal} <b>{o['grau']}</b> → <b>{o['pct']}%</b>\n"
         msg += "\n"
 
-        # Todas as opções
         msg += "📋 <b>Todas as opções:</b>\n"
-        for o in outcomes:
+        for o in outcomes_amanha:
             bar = "█" * int(o["pct"] / 5) + "░" * (20 - int(o["pct"] / 5))
             msg += f"  {o['grau']:<8} {bar} {o['pct']}%\n"
         msg += "\n"
 
-    # Previsão 5 dias
+    # Previsão 5 dias — °C e °F
     if previsao:
         msg += "📅 <b>Previsão 5 dias (Seoul):</b>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
         for p in previsao[:5]:
-            msg += f"  {p['data']} → 🔺{p['max']}°C  🔻{p['min']}°C\n"
+            mx, mn = p["max"], p["min"]
+            msg += f"  {p['data']} → 🔺{mx}°C ({c_para_f(mx)}°F)  🔻{mn}°C ({c_para_f(mn)}°F)\n"
         msg += "\n"
 
-    msg += f"🔗 <a href=\"{link}\">Abrir no Polymarket</a>\n"
+    if link:
+        msg += f"🔗 <a href=\"{link}\">Polymarket Amanhã</a>\n"
     msg += f"📡 <a href=\"https://www.wunderground.com/weather/kr/incheon/RKSI\">Wunderground RKSI</a>"
 
     return msg
@@ -368,71 +385,139 @@ def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo, modelos=None):
 #  MAIN
 # ═══════════════════════════════════════════
 
-def executar():
-    """Executa uma varredura completa."""
+# ═══════════════════════════════════════════
+#  MONITORAMENTO — busca temp a cada 10s via Open-Meteo (sem cache)
+# ═══════════════════════════════════════════
+
+def buscar_temp_atual_rapido():
+    """Busca temperatura ATUAL via Open-Meteo — rápido, sem Selenium, sem cache."""
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast",
+            params={"latitude": 37.46, "longitude": 126.44,
+                    "current": "temperature_2m",
+                    "timezone": "Asia/Seoul"},
+            headers={"Cache-Control": "no-cache"},
+            timeout=8)
+        d = r.json().get("current", {})
+        return d.get("temperature_2m"), d.get("time", "")
+    except:
+        return None, ""
+
+
+def executar_completo():
+    """Varredura completa: WU + Polymarket AMANHÃ + previsão + modelos."""
     print(f"\n{'='*50}")
-    print(f"  VARREDURA {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"  VARREDURA COMPLETA {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     print(f"{'='*50}")
 
     hoje = date.today()
+    amanha = hoje + timedelta(days=1)
 
-    # 1. Temperatura atual do Wunderground
     print("[1] Buscando temperatura Wunderground...")
     temp = buscar_temp_wunderground()
 
-    # 2. Polymarket — mercado de hoje
-    print("[2] Buscando Polymarket Seoul...")
-    outcomes, slug = buscar_polymarket_seoul(hoje)
-    if outcomes:
-        print(f"    Top 3: {', '.join(f'{o[\"grau\"]}={o[\"pct\"]}%' for o in outcomes[:3])}")
-    else:
-        print("    Sem mercado para hoje")
+    print(f"[2] Buscando Polymarket Seoul AMANHÃ ({amanha.strftime('%d/%m')})...")
+    outcomes_amanha, slug_amanha = buscar_polymarket_seoul(amanha)
+    if outcomes_amanha:
+        top3 = [o["grau"] + "=" + str(o["pct"]) + "%" for o in outcomes_amanha[:3]]
+        print(f"    Top 3: {', '.join(top3)}")
 
-    # 3. Previsão 5 dias
     print("[3] Buscando previsão 5 dias...")
     previsao = buscar_previsao_5dias()
     if previsao:
-        print(f"    {', '.join(f'{p[\"data\"]}:{p[\"max\"]}°C' for p in previsao[:5])}")
+        dias = [p["data"] + ":" + str(p["max"]) + "°C" for p in previsao[:5]]
+        print(f"    {', '.join(dias)}")
 
-    # 4. Modelos ECMWF + GFS para amanhã
     print("[4] Buscando ECMWF + GFS para amanhã...")
     modelos = buscar_modelos_amanha()
 
-    # 5. Formata e envia
-    msg = formatar_mensagem(temp, outcomes, slug, previsao, hoje, modelos)
+    msg = formatar_mensagem(temp, outcomes_amanha, slug_amanha, previsao, hoje, modelos)
     enviar(msg)
-    print("[OK] Mensagem enviada!")
+    print("[OK] Varredura completa enviada!")
+
+    return outcomes_amanha, slug_amanha
 
 
 def main():
     print("╔══════════════════════════════════════════╗")
-    print("║  SEOUL WEATHER BOT — WU + Polymarket     ║")
-    print("║  Selenium + Gamma API + Open-Meteo       ║")
-    print(f"║  Intervalo: {INTERVALO//60} min                        ║")
+    print("║  SEOUL WEATHER BOT — Monitor Tempo Real  ║")
+    print("║  Selenium + Open-Meteo + Polymarket      ║")
+    print("║  Monitora a cada 10s, envia se mudou     ║")
     print("╚══════════════════════════════════════════╝")
 
     enviar(
         "🤖 <b>Seoul Weather Bot Ativo!</b>\n\n"
         "📡 Wunderground RKSI (Selenium)\n"
         "📊 Polymarket Seoul\n"
-        "🌐 Open-Meteo previsão\n\n"
-        f"⏱️ Atualiza a cada {INTERVALO//60} min"
+        "�🇺 ECMWF + 🇺🇸 GFS\n\n"
+        "⚡ Monitora a cada 10s\n"
+        "📩 Envia quando temperatura muda"
     )
+
+    # Varredura completa inicial
+    outcomes, slug = executar_completo()
+
+    ultima_temp = None
+    ciclo = 0
 
     while True:
         try:
-            executar()
+            time.sleep(10)
+            ciclo += 1
+
+            # Busca temperatura atual (rápido, sem Selenium)
+            temp_agora, hora_str = buscar_temp_atual_rapido()
+
+            if temp_agora is None:
+                continue
+
+            temp_arredondada = round(temp_agora, 1)
+
+            # Se mudou → envia alerta
+            if temp_arredondada != ultima_temp:
+                hora = hora_str.split("T")[1][:5] if "T" in hora_str else "?"
+                direcao = ""
+                if ultima_temp is not None:
+                    diff = temp_arredondada - ultima_temp
+                    if diff > 0:
+                        direcao = f" ⬆️ +{diff:.1f}°C"
+                    elif diff < 0:
+                        direcao = f" ⬇️ {diff:.1f}°C"
+
+                print(f"[🌡️] {temp_arredondada}°C (era {ultima_temp}°C){direcao} — {hora} KST")
+
+                f_agora = c_para_f(temp_arredondada)
+                msg = (
+                    f"🌡️ <b>Seoul: {temp_arredondada}°C / {f_agora}°F</b>{direcao}\n"
+                    f"⏰ {hora} KST (Wunderground RKSI)\n"
+                )
+
+                # Mostra top 3 do mercado se disponível
+                if outcomes:
+                    msg += "\n📊 Polymarket:\n"
+                    for o in outcomes[:3]:
+                        msg += f"  {o['grau']}: {o['pct']}%\n"
+
+                if slug:
+                    msg += f"\n🔗 <a href=\"https://polymarket.com/event/{slug}\">Mercado</a>"
+
+                enviar(msg)
+                ultima_temp = temp_arredondada
+
+            # A cada 5 min (30 ciclos) → varredura completa
+            if ciclo % 30 == 0:
+                outcomes, slug = executar_completo()
+
+            # Log a cada 60s
+            if ciclo % 6 == 0:
+                print(f"  [{datetime.now().strftime('%H:%M:%S')}] {temp_arredondada}°C (sem mudança)")
+
         except KeyboardInterrupt:
             print("\n[INFO] Encerrado.")
             break
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             print(f"[ERRO] {e}")
-            time.sleep(30)
-
-        print(f"\n[AGUARDANDO {INTERVALO}s]")
-        time.sleep(INTERVALO)
+            time.sleep(10)
 
 
 if __name__ == "__main__":
