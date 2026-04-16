@@ -152,7 +152,7 @@ def buscar_previsao_5dias():
 
 
 def buscar_previsao_openmeteo():
-    """Fallback: previsão via Open-Meteo (gratuito, sem Selenium)."""
+    """Fallback: previsão via Open-Meteo GFS (gratuito, sem Selenium)."""
     try:
         r = requests.get("https://api.open-meteo.com/v1/forecast",
             params={"latitude": 37.46, "longitude": 126.44,
@@ -168,13 +168,77 @@ def buscar_previsao_openmeteo():
             dt = datetime.strptime(datas[i], "%Y-%m-%d")
             prev.append({
                 "data": dt.strftime("%d/%m"),
-                "max": round(maxs[i]),
-                "min": round(mins[i]),
+                "max": round(maxs[i], 1),
+                "min": round(mins[i], 1),
             })
         return prev
     except Exception as e:
-        print(f"[OM] Erro: {e}")
+        print(f"[GFS] Erro: {e}")
         return []
+
+
+def buscar_modelos_amanha():
+    """
+    Busca previsão de máxima para AMANHÃ em Seoul usando 3 modelos:
+      - GFS (Open-Meteo padrão)
+      - ECMWF (modelo europeu — mais preciso do mundo)
+      - Open-Meteo Best Match (ensemble)
+    Retorna dict com cada modelo.
+    """
+    amanha = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+    lat, lon = 37.46, 126.44
+    resultado = {"gfs": None, "ecmwf": None, "best": None, "data": amanha}
+
+    # GFS
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/gfs",
+            params={"latitude": lat, "longitude": lon,
+                    "daily": "temperature_2m_max", "timezone": "Asia/Seoul",
+                    "forecast_days": 3}, timeout=10)
+        d = r.json().get("daily", {})
+        datas = d.get("time", [])
+        maxs = d.get("temperature_2m_max", [])
+        if amanha in datas:
+            resultado["gfs"] = round(maxs[datas.index(amanha)], 1)
+            print(f"  [GFS] Amanhã: {resultado['gfs']}°C")
+    except Exception as e:
+        print(f"  [GFS] Erro: {e}")
+
+    # ECMWF
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/ecmwf",
+            params={"latitude": lat, "longitude": lon,
+                    "daily": "temperature_2m_max", "timezone": "Asia/Seoul",
+                    "forecast_days": 3}, timeout=10)
+        d = r.json().get("daily", {})
+        datas = d.get("time", [])
+        maxs = d.get("temperature_2m_max", [])
+        if amanha in datas:
+            resultado["ecmwf"] = round(maxs[datas.index(amanha)], 1)
+            print(f"  [ECMWF] Amanhã: {resultado['ecmwf']}°C")
+    except Exception as e:
+        print(f"  [ECMWF] Erro: {e}")
+
+    # Best Match (ensemble de modelos)
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast",
+            params={"latitude": lat, "longitude": lon,
+                    "daily": "temperature_2m_max", "timezone": "Asia/Seoul",
+                    "forecast_days": 3}, timeout=10)
+        d = r.json().get("daily", {})
+        datas = d.get("time", [])
+        maxs = d.get("temperature_2m_max", [])
+        if amanha in datas:
+            resultado["best"] = round(maxs[datas.index(amanha)], 1)
+            print(f"  [BEST] Amanhã: {resultado['best']}°C")
+    except Exception as e:
+        print(f"  [BEST] Erro: {e}")
+
+    # Média dos modelos
+    vals = [v for v in [resultado["gfs"], resultado["ecmwf"], resultado["best"]] if v is not None]
+    resultado["media"] = round(sum(vals) / len(vals), 1) if vals else None
+
+    return resultado
 
 
 # ═══════════════════════════════════════════
@@ -242,7 +306,7 @@ def buscar_polymarket_seoul(data_alvo):
 #  FORMATAR MENSAGEM
 # ═══════════════════════════════════════════
 
-def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo):
+def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo, modelos=None):
     """Monta mensagem completa pro Telegram."""
     link = f"https://polymarket.com/event/{slug}"
 
@@ -256,6 +320,19 @@ def formatar_mensagem(temp, outcomes, slug, previsao, data_alvo):
     if temp.get("max"):
         msg += f"📈 Máxima hoje: <b>{temp['max']}°C</b> | Mínima: {temp.get('min','?')}°C\n"
     msg += "\n"
+
+    # Modelos para AMANHÃ
+    if modelos and modelos.get("media"):
+        amanha_dt = datetime.strptime(modelos["data"], "%Y-%m-%d")
+        msg += f"🔮 <b>PREVISÃO AMANHÃ ({amanha_dt.strftime('%d/%m')}):</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        if modelos.get("ecmwf"):
+            msg += f"  🇪🇺 ECMWF: <b>{modelos['ecmwf']}°C</b>\n"
+        if modelos.get("gfs"):
+            msg += f"  🇺🇸 GFS: <b>{modelos['gfs']}°C</b>\n"
+        if modelos.get("best"):
+            msg += f"  🌐 Best Match: <b>{modelos['best']}°C</b>\n"
+        msg += f"  📊 Média: <b>{modelos['media']}°C</b>\n\n"
 
     # Top 3 do mercado
     if outcomes:
@@ -317,8 +394,12 @@ def executar():
     if previsao:
         print(f"    {', '.join(f'{p[\"data\"]}:{p[\"max\"]}°C' for p in previsao[:5])}")
 
-    # 4. Formata e envia
-    msg = formatar_mensagem(temp, outcomes, slug, previsao, hoje)
+    # 4. Modelos ECMWF + GFS para amanhã
+    print("[4] Buscando ECMWF + GFS para amanhã...")
+    modelos = buscar_modelos_amanha()
+
+    # 5. Formata e envia
+    msg = formatar_mensagem(temp, outcomes, slug, previsao, hoje, modelos)
     enviar(msg)
     print("[OK] Mensagem enviada!")
 
