@@ -42,7 +42,7 @@ from datetime import datetime, date, timedelta, timezone
 TELEGRAM_TOKEN   = "8744601987:AAFVTdhf2qyDE-OgooIesuHMd9PmhBGSIqo"
 TELEGRAM_CHAT_ID = "-1003910452966"
 
-MIN_EDGE         = 8.0    # % mínimo de edge para alertar
+MIN_EDGE         = 5.0    # % mínimo de edge para alertar
 INTERVALO_MIN    = 5      # minutos entre varreduras
 ALERTAR_SAIDA    = True   # alertar quando cota subiu (saída antecipada)
 
@@ -500,6 +500,16 @@ def nivel_edge(edge: float) -> str:
             return icone
     return "📊"
 
+def confianca_edge(edge: float, incerteza: float, chuva_pct: float = 0) -> str:
+    """Calcula nível de confiança baseado em edge, incerteza e chuva."""
+    score = edge
+    if incerteza <= 1.2: score += 5
+    elif incerteza >= 2.0: score -= 5
+    if chuva_pct > 50: score -= 8
+    if score >= 20: return "🟢 Alta"
+    if score >= 12: return "🟡 Média"
+    return "🔴 Baixa"
+
 def alvo_saida(price: float) -> str:
     """Estima preço alvo para saída antecipada."""
     alvo = min(0.98, price + (1 - price) * 0.45)
@@ -516,32 +526,36 @@ def msg_alerta_entrada(cidade_key, cfg, data_alvo, prev, edges_top, slug) -> str
     w_emoji    = wcode_emoji(prev.get("wcode", 0)) if prev else "🌤️"
     tmax       = prev.get("tmax", "?") if prev else "?"
     chuva      = prev.get("chuva_pct", 0) if prev else 0
+    incerteza  = 1.2 if chuva < 30 else 1.8 if chuva < 60 else 2.5
+    conf       = confianca_edge(top_edge, incerteza, chuva)
+    top        = edges_top[0]
+    acao       = "BUY YES" if top["edge"] > 0 else "SELL"
 
-    # Cabeçalho
-    msg  = f"{icone_edge} <b>EDGE DETECTADO — {cidade}</b>\n"
-    msg += f"📅 {data_str}  {emoji_janela()} Janela: {j.upper()}\n"
+    # Formato limpo
+    msg  = f"� <b>OPORTUNIDADE DETECTADA</b>\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"� Cidade: <b>{cidade}</b> ({cfg['station']})\n"
+    msg += f"📅 Data: <b>{data_str}</b>\n"
+    msg += f"🌡️ Temperatura: <b>{tmax}°C</b> {w_emoji} (💧{chuva}%)\n"
+    msg += f"📊 Mercado: <b>{top['prob_mkt']}%</b>\n"
+    msg += f"🧠 Real: <b>{top['prob_real']}%</b>\n"
+    msg += f"� Edge: <b>+{top['edge']}%</b>\n"
+    msg += f"🎯 Ação: <b>{acao} {top['outcome']} @ {top['price']:.2f}¢</b>\n"
+    msg += f"⚡ Confiança: <b>{conf}</b>\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    # Previsão do modelo
-    msg += f"🌡️ <b>Previsão Open-Meteo ({cfg['fonte_oficial']}):</b>\n"
-    msg += f"  {w_emoji} Máxima: <b>{tmax}°C</b>"
-    if prev and prev.get("tmin") is not None:
-        msg += f"  Mínima: {prev['tmin']}°C"
-    msg += f"\n  💧 Chuva: {chuva}%\n\n"
+    # Outras oportunidades
+    if len(edges_top) > 1:
+        msg += f"📋 <b>Outras oportunidades:</b>\n"
+        for e in edges_top[1:3]:
+            em = nivel_edge(e["edge"])
+            msg += f"  {em} {e['outcome']}: Mkt {e['prob_mkt']}% → Real {e['prob_real']}% (edge +{e['edge']}%)\n"
+        msg += "\n"
 
-    # Trades
-    msg += f"⚡ <b>MELHORES TRADES (saída antecipada):</b>\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━\n"
-    for e in edges_top[:3]:
-        em     = nivel_edge(e["edge"])
-        alvo   = alvo_saida(e["price"])
-        lucro  = round((float(alvo.replace("¢","")) - e["price"]) / e["price"] * 100, 0)
-        msg += (
-            f"{em} <b>{e['outcome']}</b>\n"
-            f"   Mercado: <b>{e['prob_mkt']}%</b> → Real: <b>{e['prob_real']}%</b>\n"
-            f"   Edge: <b>+{e['edge']}%</b>  |  Entrada: <b>{e['price']:.2f}¢</b>\n"
-            f"   🎯 Alvo saída: <b>{alvo}</b>  (+{lucro:.0f}% antecipado)\n\n"
-        )
+    # Timing
+    msg += f"⏰ Vender: <b>{cfg['vender_brt']}</b> ({cfg['station']} confirma)\n"
+    alvo = alvo_saida(top["price"])
+    msg += f"🎯 Alvo saída: <b>{alvo}</b>\n\n"
 
     # Timing de saída
     msg += f"⏰ <b>Quando vender ({cfg['vender_brt']}):</b>\n"
